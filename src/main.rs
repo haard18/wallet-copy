@@ -19,7 +19,8 @@ const STATUS_FILE: &str = "status.log";
 // Heartbeat interval (seconds) - log status to verify active listening
 const HEARTBEAT_INTERVAL_SECS: u64 = 30;
 // Ping interval (seconds) - send ping to keep connection alive
-const PING_INTERVAL_SECS: u64 = 30;
+// Reduced to 20s to be more aggressive and prevent timeouts
+const PING_INTERVAL_SECS: u64 = 20;
 // Reconnection delay (seconds) - initial delay before reconnecting
 const RECONNECT_DELAY_SECS: u64 = 5;
 
@@ -300,6 +301,11 @@ async fn connect_and_monitor_wallet(
     // Message processing loop with periodic pings
     let mut ping_interval = tokio::time::interval(tokio::time::Duration::from_secs(PING_INTERVAL_SECS));
     ping_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // Send first ping immediately to establish keepalive
+    if let Err(e) = write.send(Message::Ping(vec![])).await {
+        log_status(STATUS_FILE, "ERROR", &format!("Failed to send initial ping for {}: {}", short_name, e));
+        return Err(format!("Initial ping failed: {}", e).into());
+    }
     
     loop {
         tokio::select! {
@@ -355,12 +361,17 @@ async fn connect_and_monitor_wallet(
                 bytes.clone()
             }
             Message::Ping(data) => {
-                // Respond to ping with pong
-                let _ = write.send(Message::Pong(data.clone())).await;
+                // Respond to ping with pong immediately
+                if let Err(e) = write.send(Message::Pong(data.clone())).await {
+                    log_status(STATUS_FILE, "ERROR", &format!("Failed to send pong for {}: {}", short_name, e));
+                    return Err(format!("Pong failed: {}", e).into());
+                }
                 let _ = tx_messages.send(format!("{}|{}|PING|\n", get_timestamp(), short_name));
                 continue;
             }
             Message::Pong(_) => {
+                // Server responded to our ping - connection is alive
+                stats.last_message_time = std::time::Instant::now();
                 let _ = tx_messages.send(format!("{}|{}|PONG|\n", get_timestamp(), short_name));
                 continue;
             }
@@ -521,9 +532,15 @@ async fn connect_and_monitor_wallet(
             }
             // Send periodic ping to keep connection alive
             _ = ping_interval.tick() => {
+                // Update last message time to show we're actively maintaining connection
+                stats.last_message_time = std::time::Instant::now();
                 if let Err(e) = write.send(Message::Ping(vec![])).await {
                     log_status(STATUS_FILE, "ERROR", &format!("Failed to send ping for {}: {}", short_name, e));
                     return Err(format!("Ping failed: {}", e).into());
+                }
+                // Log ping sent for debugging (only occasionally to avoid spam)
+                if stats.messages_received % 10 == 0 {
+                    log_status(STATUS_FILE, "DEBUG", &format!("Sent ping for {}", short_name));
                 }
             }
         }
