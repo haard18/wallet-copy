@@ -4,7 +4,7 @@ use futures_util::{StreamExt, SinkExt};
 use std::io::Write;
 use std::sync::mpsc;
 
-// Wallet addresses to monitor - add your addresses here
+// Wallet addresses to monitor - each gets its own connection and log file
 const WALLET_ADDRESSES: &[&str] = &[
     "0x50b309f78e774a756a2230e1769729094cac9f20",
     "0x162cc7c861ebd0c06b3d72319201150482518185",
@@ -12,9 +12,8 @@ const WALLET_ADDRESSES: &[&str] = &[
     // Add more wallet addresses here
 ];
 
-// Output files
-const EVENTS_FILE: &str = "events.log";      // Processed events (userEvents + orderUpdates)
-const MESSAGES_FILE: &str = "messages.log";  // All raw WebSocket messages
+// Output files - each wallet gets its own events file
+const MESSAGES_FILE: &str = "messages.log";  // All raw WebSocket messages (all wallets)
 const STATUS_FILE: &str = "status.log";
 
 // Heartbeat interval (seconds) - log status to verify active listening
@@ -57,11 +56,25 @@ fn get_timestamp() -> u64 {
         .as_secs()
 }
 
+/// Get wallet short name for logging (last 8 chars)
+fn get_wallet_short_name(wallet: &str) -> String {
+    if wallet.len() > 8 {
+        wallet[wallet.len()-8..].to_string()
+    } else {
+        wallet.to_string()
+    }
+}
+
+/// Get events file path for a specific wallet
+fn get_events_file_path(wallet: &str) -> String {
+    let short_name = get_wallet_short_name(wallet);
+    format!("events_{}.log", short_name)
+}
+
 /// Event handler - sends events to channel for async file writing
 #[inline(always)]
 fn handle_event(
     tx: &mpsc::Sender<String>,
-    wallet: &str,
     event_type: &str,
     coin: Option<&str>,
     side: Option<&str>,
@@ -71,9 +84,8 @@ fn handle_event(
 ) {
     let received_ts = get_timestamp();
     let line = format!(
-        "{}|{}|{}|{}|{}|{}|{}|{}\n",
+        "{}|{}|{}|{}|{}|{}|{}\n",
         received_ts,
-        wallet,
         event_type,
         coin.unwrap_or("-"),
         side.unwrap_or("-"),
@@ -88,7 +100,6 @@ fn handle_event(
 #[inline(always)]
 fn handle_order(
     tx: &mpsc::Sender<String>,
-    wallet: &str,
     coin: &str,
     side: &str,
     limit_px: &str,
@@ -100,34 +111,33 @@ fn handle_order(
 ) {
     let received_ts = get_timestamp();
     let line = format!(
-        "{}|{}|ORDER|{}|{}|{}|{}|{}|{}|{}\n",
+        "{}|ORDER|{}|{}|{}|{}|{}|{}|{}|{}\n",
         received_ts,
-        wallet,
         coin,
         side,
         sz,
         limit_px,
         oid,
         status,
+        timestamp,
         status_timestamp
     );
     let _ = tx.send(line);
 }
 
-#[tokio::main(flavor = "current_thread")]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Validate wallet addresses
-    if WALLET_ADDRESSES.is_empty() {
-        eprintln!("Error: No wallet addresses configured");
-        return Ok(());
-    }
+/// Handle a single wallet connection
+async fn handle_wallet_connection(
+    wallet: &str,
+    tx_messages: mpsc::Sender<String>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let wallet_str = wallet.to_string();
+    let short_name = get_wallet_short_name(&wallet_str);
     
-    // Create channels for offloading file writes
+    // Create channel for this wallet's events
     let (tx_events, rx_events) = mpsc::channel::<String>();
-    let (tx_messages, rx_messages) = mpsc::channel::<String>();
     
-    // Spawn dedicated thread for events file writing
-    let events_file_path = EVENTS_FILE.to_string();
+    // Spawn dedicated thread for this wallet's events file writing
+    let events_file_path = get_events_file_path(&wallet_str);
     std::thread::spawn(move || {
         let file = std::fs::OpenOptions::new()
             .create(true)
@@ -181,7 +191,263 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
     
-    // Spawn dedicated thread for raw messages file writing
+    // Statistics tracking for this wallet
+    let mut stats = Stats {
+        messages_received: 0,
+        events_processed: 0,
+        orders_processed: 0,
+        last_message_time: std::time::Instant::now(),
+        last_heartbeat: std::time::Instant::now(),
+        connection_start: std::time::Instant::now(),
+    };
+    
+    // Log startup for this wallet
+    log_status(STATUS_FILE, "STARTUP", &format!(
+        "Starting monitor for wallet {} ({})",
+        short_name, get_timestamp()
+    ));
+    eprintln!("[{}] Starting monitor for wallet {}", get_timestamp(), short_name);
+    
+    // Connect to Hyperliquid WebSocket
+    let url = "wss://api.hyperliquid.xyz/ws";
+    log_status(STATUS_FILE, "CONNECT", &format!("Connecting to {} for {}", url, short_name));
+    
+    let (ws_stream, _) = match connect_async(url).await {
+        Ok(stream) => {
+            log_status(STATUS_FILE, "CONNECTED", &format!("Successfully connected for {}", short_name));
+            eprintln!("[{}] ✓ Connected for wallet {}", get_timestamp(), short_name);
+            stream
+        }
+        Err(e) => {
+            log_status(STATUS_FILE, "ERROR", &format!("Connection failed for {}: {}", short_name, e));
+            eprintln!("[{}] ✗ Connection failed for {}: {}", get_timestamp(), short_name, e);
+            return Err(e.into());
+        }
+    };
+    
+    let (mut write, mut read) = ws_stream.split();
+    
+    // Subscribe to BOTH userEvents AND orderUpdates for this wallet
+    log_status(STATUS_FILE, "SUBSCRIBE", &format!("Subscribing for wallet {}", short_name));
+    
+    // Subscribe to userEvents (fills, funding, liquidations)
+    let subscribe_events = format!(
+        r#"{{"method":"subscribe","subscription":{{"type":"userEvents","user":"{}"}}}}"#,
+        wallet_str.to_lowercase()
+    );
+    match write.send(Message::Text(subscribe_events)).await {
+        Ok(_) => {
+            log_status(STATUS_FILE, "SUBSCRIBED", &format!("Subscribed to userEvents for {}", short_name));
+            eprintln!("[{}] ✓ Subscribed to userEvents for {}", get_timestamp(), short_name);
+        }
+        Err(e) => {
+            log_status(STATUS_FILE, "ERROR", &format!("userEvents subscription failed for {}: {}", short_name, e));
+            eprintln!("[{}] ✗ userEvents subscription failed for {}: {}", get_timestamp(), short_name, e);
+        }
+    }
+    
+    // Subscribe to orderUpdates (order status changes)
+    let subscribe_orders = format!(
+        r#"{{"method":"subscribe","subscription":{{"type":"orderUpdates","user":"{}"}}}}"#,
+        wallet_str.to_lowercase()
+    );
+    match write.send(Message::Text(subscribe_orders)).await {
+        Ok(_) => {
+            log_status(STATUS_FILE, "SUBSCRIBED", &format!("Subscribed to orderUpdates for {}", short_name));
+            eprintln!("[{}] ✓ Subscribed to orderUpdates for {}", get_timestamp(), short_name);
+        }
+        Err(e) => {
+            log_status(STATUS_FILE, "ERROR", &format!("orderUpdates subscription failed for {}: {}", short_name, e));
+            eprintln!("[{}] ✗ orderUpdates subscription failed for {}: {}", get_timestamp(), short_name, e);
+        }
+    }
+    
+    // Message processing loop
+    while let Some(msg) = read.next().await {
+        stats.messages_received += 1;
+        stats.last_message_time = std::time::Instant::now();
+        
+        // Periodic heartbeat
+        if stats.last_heartbeat.elapsed().as_secs() >= HEARTBEAT_INTERVAL_SECS {
+            let uptime = stats.connection_start.elapsed().as_secs();
+            let time_since_last_msg = stats.last_message_time.elapsed().as_secs();
+            let heartbeat_msg = format!(
+                "HEARTBEAT [{}]: uptime={}s, messages={}, events={}, orders={}, last_msg={}s ago",
+                short_name,
+                uptime,
+                stats.messages_received,
+                stats.events_processed,
+                stats.orders_processed,
+                time_since_last_msg
+            );
+            log_status(STATUS_FILE, "HEARTBEAT", &heartbeat_msg);
+            eprintln!("[{}] {}", get_timestamp(), heartbeat_msg);
+            stats.last_heartbeat = std::time::Instant::now();
+        }
+        
+        let msg = match msg {
+            Ok(m) => m,
+            Err(e) => {
+                log_status(STATUS_FILE, "ERROR", &format!("WebSocket error for {}: {}", short_name, e));
+                eprintln!("[{}] ✗ WebSocket error for {}: {}", get_timestamp(), short_name, e);
+                continue;
+            }
+        };
+        
+        // Log all messages to messages.log
+        let raw_data = match &msg {
+            Message::Text(text) => {
+                let timestamp = get_timestamp();
+                let log_line = format!("{}|{}|TEXT|{}\n", timestamp, short_name, text);
+                let _ = tx_messages.send(log_line);
+                text.as_bytes().to_vec()
+            }
+            Message::Binary(bytes) => {
+                let timestamp = get_timestamp();
+                let hex_repr = bytes.iter().take(100).map(|b| format!("{:02x}", b)).collect::<String>();
+                let log_line = format!("{}|{}|BINARY|{} ({} bytes)\n", timestamp, short_name, hex_repr, bytes.len());
+                let _ = tx_messages.send(log_line);
+                bytes.clone()
+            }
+            Message::Ping(_) => {
+                let _ = tx_messages.send(format!("{}|{}|PING|\n", get_timestamp(), short_name));
+                continue;
+            }
+            Message::Pong(_) => {
+                let _ = tx_messages.send(format!("{}|{}|PONG|\n", get_timestamp(), short_name));
+                continue;
+            }
+            Message::Close(_) => {
+                let _ = tx_messages.send(format!("{}|{}|CLOSE|\n", get_timestamp(), short_name));
+                break;
+            }
+            Message::Frame(_) => {
+                let _ = tx_messages.send(format!("{}|{}|FRAME|\n", get_timestamp(), short_name));
+                continue;
+            }
+        };
+        
+        // Parse JSON
+        let json: Value = match serde_json::from_slice(&raw_data) {
+            Ok(v) => v,
+            Err(e) => {
+                log_status(STATUS_FILE, "WARN", &format!("JSON parse error for {}: {}", short_name, e));
+                continue;
+            }
+        };
+        
+        // Check channel field
+        let channel = match json.get("channel").and_then(|v| v.as_str()) {
+            Some(c) => c,
+            None => {
+                let timestamp = get_timestamp();
+                let _ = tx_messages.send(format!("{}|{}|NO_CHANNEL|\n", timestamp, short_name));
+                continue;
+            }
+        };
+        
+        // Process userEvents channel
+        if channel == "userEvents" {
+            let data = match json.get("data") {
+                Some(d) => d,
+                None => continue,
+            };
+            
+            // Handle fills
+            if let Some(fills) = data.get("fills").and_then(|f| f.as_array()) {
+                for fill in fills {
+                    let coin = fill.get("coin").and_then(|v| v.as_str());
+                    let side = fill.get("side").and_then(|v| v.as_str());
+                    let size = fill.get("sz").and_then(|v| v.as_str());
+                    let price = fill.get("px").and_then(|v| v.as_str());
+                    let time = fill.get("time").and_then(|v| v.as_i64());
+                    
+                    handle_event(&tx_events, "fill", coin, side, size, price, time);
+                    stats.events_processed += 1;
+                }
+            }
+            
+            // Handle funding
+            if let Some(funding) = data.get("funding") {
+                let coin = funding.get("coin").and_then(|v| v.as_str());
+                let time = funding.get("time").and_then(|v| v.as_i64());
+                
+                handle_event(&tx_events, "funding", coin, None, None, None, time);
+                stats.events_processed += 1;
+            }
+            
+            // Handle liquidation
+            if let Some(_liquidation) = data.get("liquidation") {
+                handle_event(&tx_events, "liquidation", None, None, None, None, None);
+                stats.events_processed += 1;
+            }
+            
+            // Handle nonUserCancel
+            if let Some(cancels) = data.get("nonUserCancel").and_then(|c| c.as_array()) {
+                for cancel in cancels {
+                    let coin = cancel.get("coin").and_then(|v| v.as_str());
+                    handle_event(&tx_events, "nonUserCancel", coin, None, None, None, None);
+                    stats.events_processed += 1;
+                }
+            }
+        }
+        
+        // Process orderUpdates channel
+        else if channel == "orderUpdates" {
+            let orders_iter: Box<dyn Iterator<Item = &Value>> = match json.get("data") {
+                Some(d) if d.is_array() => Box::new(d.as_array().unwrap().iter()),
+                Some(d) if d.is_object() => Box::new(std::iter::once(d)),
+                _ => continue,
+            };
+            
+            for order_update in orders_iter {
+                let order = match order_update.get("order") {
+                    Some(o) => o,
+                    None => continue,
+                };
+                
+                let coin = order.get("coin").and_then(|v| v.as_str()).unwrap_or("-");
+                let side = order.get("side").and_then(|v| v.as_str()).unwrap_or("-");
+                let limit_px = order.get("limitPx").and_then(|v| v.as_str()).unwrap_or("-");
+                let sz = order.get("sz").and_then(|v| v.as_str()).unwrap_or("-");
+                let oid = order.get("oid").and_then(|v| v.as_i64()).unwrap_or(0);
+                let timestamp = order.get("timestamp").and_then(|v| v.as_i64()).unwrap_or(0);
+                
+                let status = order_update.get("status").and_then(|v| v.as_str()).unwrap_or("-");
+                let status_timestamp = order_update.get("statusTimestamp").and_then(|v| v.as_i64()).unwrap_or(0);
+                
+                handle_order(&tx_events, coin, side, limit_px, sz, oid, status, timestamp, status_timestamp);
+                stats.orders_processed += 1;
+            }
+        }
+    }
+    
+    // Connection closed
+    log_status(STATUS_FILE, "DISCONNECTED", &format!(
+        "Connection closed for {}. Total: {} messages, {} events, {} orders processed",
+        short_name,
+        stats.messages_received,
+        stats.events_processed,
+        stats.orders_processed
+    ));
+    eprintln!("[{}] Connection closed for {}. Processed {} messages, {} events, {} orders", 
+        get_timestamp(), short_name, stats.messages_received, stats.events_processed, stats.orders_processed);
+    
+    Ok(())
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Validate wallet addresses
+    if WALLET_ADDRESSES.is_empty() {
+        eprintln!("Error: No wallet addresses configured");
+        return Ok(());
+    }
+    
+    // Create channel for messages (shared across all wallets)
+    let (tx_messages, rx_messages) = mpsc::channel::<String>();
+    
+    // Spawn dedicated thread for messages file writing (shared)
     let messages_file_path = MESSAGES_FILE.to_string();
     std::thread::spawn(move || {
         let file = std::fs::OpenOptions::new()
@@ -236,16 +502,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
     
-    // Statistics tracking
-    let mut stats = Stats {
-        messages_received: 0,
-        events_processed: 0,
-        orders_processed: 0,
-        last_message_time: std::time::Instant::now(),
-        last_heartbeat: std::time::Instant::now(),
-        connection_start: std::time::Instant::now(),
-    };
-    
     // Log startup
     log_status(STATUS_FILE, "STARTUP", &format!(
         "Starting wallet monitor for {} wallet(s) at {}",
@@ -254,242 +510,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     ));
     eprintln!("[{}] Starting wallet monitor for {} wallet(s)", get_timestamp(), WALLET_ADDRESSES.len());
     
-    // Connect to Hyperliquid WebSocket
-    let url = "wss://api.hyperliquid.xyz/ws";
-    log_status(STATUS_FILE, "CONNECT", &format!("Connecting to {}", url));
-    eprintln!("[{}] Connecting to {}...", get_timestamp(), url);
-    
-    let (ws_stream, _) = match connect_async(url).await {
-        Ok(stream) => {
-            log_status(STATUS_FILE, "CONNECTED", &format!("Successfully connected to {}", url));
-            eprintln!("[{}] ✓ Connected to {}", get_timestamp(), url);
-            stream
-        }
-        Err(e) => {
-            log_status(STATUS_FILE, "ERROR", &format!("Connection failed: {}", e));
-            eprintln!("[{}] ✗ Connection failed: {}", get_timestamp(), e);
-            return Err(e.into());
-        }
-    };
-    
-    let (mut write, mut read) = ws_stream.split();
-    
-    // Subscribe to BOTH userEvents AND orderUpdates for all wallets
-    log_status(STATUS_FILE, "SUBSCRIBE", &format!("Subscribing to {} wallet(s)", WALLET_ADDRESSES.len()));
+    // Spawn a task for each wallet (separate connections)
+    let mut handles = vec![];
     for wallet in WALLET_ADDRESSES {
-        // Subscribe to userEvents (fills, funding, liquidations)
-        let subscribe_events = format!(
-            r#"{{"method":"subscribe","subscription":{{"type":"userEvents","user":"{}"}}}}"#,
-            wallet.to_lowercase()
-        );
-        match write.send(Message::Text(subscribe_events)).await {
-            Ok(_) => {
-                log_status(STATUS_FILE, "SUBSCRIBED", &format!("Subscribed to userEvents for {}", wallet));
-                eprintln!("[{}] ✓ Subscribed to userEvents for {}", get_timestamp(), wallet);
-            }
-            Err(e) => {
-                log_status(STATUS_FILE, "ERROR", &format!("userEvents subscription failed for {}: {}", wallet, e));
-                eprintln!("[{}] ✗ userEvents subscription failed for {}: {}", get_timestamp(), wallet, e);
-            }
-        }
+        let tx_messages_clone = tx_messages.clone();
+        let wallet_str = wallet.to_string();
         
-        // Subscribe to orderUpdates (order status changes)
-        let subscribe_orders = format!(
-            r#"{{"method":"subscribe","subscription":{{"type":"orderUpdates","user":"{}"}}}}"#,
-            wallet.to_lowercase()
-        );
-        match write.send(Message::Text(subscribe_orders)).await {
-            Ok(_) => {
-                log_status(STATUS_FILE, "SUBSCRIBED", &format!("Subscribed to orderUpdates for {}", wallet));
-                eprintln!("[{}] ✓ Subscribed to orderUpdates for {}", get_timestamp(), wallet);
+        let handle = tokio::spawn(async move {
+            if let Err(e) = handle_wallet_connection(&wallet_str, tx_messages_clone).await {
+                eprintln!("[{}] Error handling wallet {}: {}", get_timestamp(), wallet_str, e);
             }
-            Err(e) => {
-                log_status(STATUS_FILE, "ERROR", &format!("orderUpdates subscription failed for {}: {}", wallet, e));
-                eprintln!("[{}] ✗ orderUpdates subscription failed for {}: {}", get_timestamp(), wallet, e);
-            }
-        }
+        });
+        
+        handles.push(handle);
     }
     
-    // Message processing loop
-    while let Some(msg) = read.next().await {
-        stats.messages_received += 1;
-        stats.last_message_time = std::time::Instant::now();
-        
-        // Periodic heartbeat
-        if stats.last_heartbeat.elapsed().as_secs() >= HEARTBEAT_INTERVAL_SECS {
-            let uptime = stats.connection_start.elapsed().as_secs();
-            let time_since_last_msg = stats.last_message_time.elapsed().as_secs();
-            let heartbeat_msg = format!(
-                "HEARTBEAT: uptime={}s, messages={}, events={}, orders={}, last_msg={}s ago",
-                uptime,
-                stats.messages_received,
-                stats.events_processed,
-                stats.orders_processed,
-                time_since_last_msg
-            );
-            log_status(STATUS_FILE, "HEARTBEAT", &heartbeat_msg);
-            eprintln!("[{}] {}", get_timestamp(), heartbeat_msg);
-            stats.last_heartbeat = std::time::Instant::now();
-        }
-        
-        let msg = match msg {
-            Ok(m) => m,
-            Err(e) => {
-                log_status(STATUS_FILE, "ERROR", &format!("WebSocket error: {}", e));
-                eprintln!("[{}] ✗ WebSocket error: {}", get_timestamp(), e);
-                continue;
-            }
-        };
-        
-        // Log all messages to messages.log
-        let raw_data = match &msg {
-            Message::Text(text) => {
-                let timestamp = get_timestamp();
-                let log_line = format!("{}|TEXT|{}\n", timestamp, text);
-                let _ = tx_messages.send(log_line);
-                text.as_bytes().to_vec()
-            }
-            Message::Binary(bytes) => {
-                let timestamp = get_timestamp();
-                let hex_repr = bytes.iter().take(100).map(|b| format!("{:02x}", b)).collect::<String>();
-                let log_line = format!("{}|BINARY|{} ({} bytes)\n", timestamp, hex_repr, bytes.len());
-                let _ = tx_messages.send(log_line);
-                bytes.clone()
-            }
-            Message::Ping(_) => {
-                let _ = tx_messages.send(format!("{}|PING|\n", get_timestamp()));
-                continue;
-            }
-            Message::Pong(_) => {
-                let _ = tx_messages.send(format!("{}|PONG|\n", get_timestamp()));
-                continue;
-            }
-            Message::Close(_) => {
-                let _ = tx_messages.send(format!("{}|CLOSE|\n", get_timestamp()));
-                break;
-            }
-            Message::Frame(_) => {
-                let _ = tx_messages.send(format!("{}|FRAME|\n", get_timestamp()));
-                continue;
-            }
-        };
-        
-        // Parse JSON
-        let json: Value = match serde_json::from_slice(&raw_data) {
-            Ok(v) => v,
-            Err(e) => {
-                log_status(STATUS_FILE, "WARN", &format!("JSON parse error: {}", e));
-                continue;
-            }
-        };
-        
-        // Check channel field
-        let channel = match json.get("channel").and_then(|v| v.as_str()) {
-            Some(c) => c,
-            None => {
-                let timestamp = get_timestamp();
-                let _ = tx_messages.send(format!("{}|NO_CHANNEL|\n", timestamp));
-                continue;
-            }
-        };
-        
-        // Process userEvents channel
-        if channel == "userEvents" {
-            let wallet = json.get("data")
-                .and_then(|d| d.get("user"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("unknown");
-            
-            // userEvents can contain: fills, funding, liquidation, or nonUserCancel
-            let data = match json.get("data") {
-                Some(d) => d,
-                None => continue,
-            };
-            
-            // Handle fills
-            if let Some(fills) = data.get("fills").and_then(|f| f.as_array()) {
-                for fill in fills {
-                    let coin = fill.get("coin").and_then(|v| v.as_str());
-                    let side = fill.get("side").and_then(|v| v.as_str());
-                    let size = fill.get("sz").and_then(|v| v.as_str());
-                    let price = fill.get("px").and_then(|v| v.as_str());
-                    let time = fill.get("time").and_then(|v| v.as_i64());
-                    
-                    handle_event(&tx_events, wallet, "fill", coin, side, size, price, time);
-                    stats.events_processed += 1;
-                }
-            }
-            
-            // Handle funding
-            if let Some(funding) = data.get("funding") {
-                let coin = funding.get("coin").and_then(|v| v.as_str());
-                let time = funding.get("time").and_then(|v| v.as_i64());
-                
-                handle_event(&tx_events, wallet, "funding", coin, None, None, None, time);
-                stats.events_processed += 1;
-            }
-            
-            // Handle liquidation
-            if let Some(_liquidation) = data.get("liquidation") {
-                handle_event(&tx_events, wallet, "liquidation", None, None, None, None, None);
-                stats.events_processed += 1;
-            }
-            
-            // Handle nonUserCancel
-            if let Some(cancels) = data.get("nonUserCancel").and_then(|c| c.as_array()) {
-                for cancel in cancels {
-                    let coin = cancel.get("coin").and_then(|v| v.as_str());
-                    handle_event(&tx_events, wallet, "nonUserCancel", coin, None, None, None, None);
-                    stats.events_processed += 1;
-                }
-            }
-        }
-        
-        // Process orderUpdates channel
-        else if channel == "orderUpdates" {
-            let wallet = json.get("data")
-                .and_then(|d| d.get("user"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("unknown");
-            
-            let orders = match json.get("data")
-                .and_then(|d| d.as_array())
-            {
-                Some(arr) => arr,
-                None => continue,
-            };
-            
-            for order_update in orders {
-                let order = match order_update.get("order") {
-                    Some(o) => o,
-                    None => continue,
-                };
-                
-                let coin = order.get("coin").and_then(|v| v.as_str()).unwrap_or("-");
-                let side = order.get("side").and_then(|v| v.as_str()).unwrap_or("-");
-                let limit_px = order.get("limitPx").and_then(|v| v.as_str()).unwrap_or("-");
-                let sz = order.get("sz").and_then(|v| v.as_str()).unwrap_or("-");
-                let oid = order.get("oid").and_then(|v| v.as_i64()).unwrap_or(0);
-                let timestamp = order.get("timestamp").and_then(|v| v.as_i64()).unwrap_or(0);
-                
-                let status = order_update.get("status").and_then(|v| v.as_str()).unwrap_or("-");
-                let status_timestamp = order_update.get("statusTimestamp").and_then(|v| v.as_i64()).unwrap_or(0);
-                
-                handle_order(&tx_events, wallet, coin, side, limit_px, sz, oid, status, timestamp, status_timestamp);
-                stats.orders_processed += 1;
-            }
-        }
+    // Wait for all wallet connections to complete
+    for handle in handles {
+        let _ = handle.await;
     }
     
-    // Connection closed
-    log_status(STATUS_FILE, "DISCONNECTED", &format!(
-        "Connection closed. Total: {} messages, {} events, {} orders processed",
-        stats.messages_received,
-        stats.events_processed,
-        stats.orders_processed
-    ));
-    eprintln!("[{}] Connection closed. Processed {} messages, {} events, {} orders", 
-        get_timestamp(), stats.messages_received, stats.events_processed, stats.orders_processed);
+    eprintln!("[{}] All wallet connections closed", get_timestamp());
     
     Ok(())
 }
