@@ -18,6 +18,10 @@ const STATUS_FILE: &str = "status.log";
 
 // Heartbeat interval (seconds) - log status to verify active listening
 const HEARTBEAT_INTERVAL_SECS: u64 = 30;
+// Ping interval (seconds) - send ping to keep connection alive
+const PING_INTERVAL_SECS: u64 = 30;
+// Reconnection delay (seconds) - initial delay before reconnecting
+const RECONNECT_DELAY_SECS: u64 = 5;
 
 /// Statistics tracking for monitoring
 struct Stats {
@@ -125,8 +129,37 @@ fn handle_order(
     let _ = tx.send(line);
 }
 
-/// Handle a single wallet connection
+/// Handle a single wallet connection with automatic reconnection
 async fn handle_wallet_connection(
+    wallet: &str,
+    tx_messages: mpsc::Sender<String>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let wallet_str = wallet.to_string();
+    let mut reconnect_delay = RECONNECT_DELAY_SECS;
+    
+    loop {
+        match connect_and_monitor_wallet(&wallet_str, tx_messages.clone()).await {
+            Ok(_) => {
+                // Normal shutdown, exit
+                break;
+            }
+            Err(e) => {
+                let short_name = get_wallet_short_name(&wallet_str);
+                log_status(STATUS_FILE, "ERROR", &format!("Connection lost for {}: {}. Reconnecting in {}s...", short_name, e, reconnect_delay));
+                eprintln!("[{}] ✗ Connection lost for {}. Reconnecting in {}s...", get_timestamp(), short_name, reconnect_delay);
+                
+                // Exponential backoff (max 60 seconds)
+                tokio::time::sleep(tokio::time::Duration::from_secs(reconnect_delay)).await;
+                reconnect_delay = (reconnect_delay * 2).min(60);
+            }
+        }
+    }
+    
+    Ok(())
+}
+
+/// Connect and monitor a single wallet (called by handle_wallet_connection for reconnection)
+async fn connect_and_monitor_wallet(
     wallet: &str,
     tx_messages: mpsc::Sender<String>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -243,6 +276,7 @@ async fn handle_wallet_connection(
         Err(e) => {
             log_status(STATUS_FILE, "ERROR", &format!("userEvents subscription failed for {}: {}", short_name, e));
             eprintln!("[{}] ✗ userEvents subscription failed for {}: {}", get_timestamp(), short_name, e);
+            return Err(format!("Subscription failed: {}", e).into());
         }
     }
     
@@ -259,43 +293,54 @@ async fn handle_wallet_connection(
         Err(e) => {
             log_status(STATUS_FILE, "ERROR", &format!("orderUpdates subscription failed for {}: {}", short_name, e));
             eprintln!("[{}] ✗ orderUpdates subscription failed for {}: {}", get_timestamp(), short_name, e);
+            return Err(format!("Subscription failed: {}", e).into());
         }
     }
     
-    // Message processing loop
-    while let Some(msg) = read.next().await {
-        stats.messages_received += 1;
-        stats.last_message_time = std::time::Instant::now();
-        
-        // Periodic heartbeat
-        if stats.last_heartbeat.elapsed().as_secs() >= HEARTBEAT_INTERVAL_SECS {
-            let uptime = stats.connection_start.elapsed().as_secs();
-            let time_since_last_msg = stats.last_message_time.elapsed().as_secs();
-            let heartbeat_msg = format!(
-                "HEARTBEAT [{}]: uptime={}s, messages={}, events={}, orders={}, last_msg={}s ago",
-                short_name,
-                uptime,
-                stats.messages_received,
-                stats.events_processed,
-                stats.orders_processed,
-                time_since_last_msg
-            );
-            log_status(STATUS_FILE, "HEARTBEAT", &heartbeat_msg);
-            eprintln!("[{}] {}", get_timestamp(), heartbeat_msg);
-            stats.last_heartbeat = std::time::Instant::now();
-        }
-        
-        let msg = match msg {
-            Ok(m) => m,
-            Err(e) => {
-                log_status(STATUS_FILE, "ERROR", &format!("WebSocket error for {}: {}", short_name, e));
-                eprintln!("[{}] ✗ WebSocket error for {}: {}", get_timestamp(), short_name, e);
-                continue;
-            }
-        };
-        
-        // Log all messages to messages.log
-        let raw_data = match &msg {
+    // Message processing loop with periodic pings
+    let mut ping_interval = tokio::time::interval(tokio::time::Duration::from_secs(PING_INTERVAL_SECS));
+    ping_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    
+    loop {
+        tokio::select! {
+            // Handle incoming messages
+            msg_opt = read.next() => {
+                let msg = match msg_opt {
+                    Some(Ok(m)) => m,
+                    Some(Err(e)) => {
+                        log_status(STATUS_FILE, "ERROR", &format!("WebSocket error for {}: {}", short_name, e));
+                        eprintln!("[{}] ✗ WebSocket error for {}: {}", get_timestamp(), short_name, e);
+                        return Err(format!("WebSocket error: {}", e).into());
+                    }
+                    None => {
+                        // Stream ended
+                        return Err("WebSocket stream ended".into());
+                    }
+                };
+                
+                stats.messages_received += 1;
+                stats.last_message_time = std::time::Instant::now();
+                
+                // Periodic heartbeat
+                if stats.last_heartbeat.elapsed().as_secs() >= HEARTBEAT_INTERVAL_SECS {
+                    let uptime = stats.connection_start.elapsed().as_secs();
+                    let time_since_last_msg = stats.last_message_time.elapsed().as_secs();
+                    let heartbeat_msg = format!(
+                        "HEARTBEAT [{}]: uptime={}s, messages={}, events={}, orders={}, last_msg={}s ago",
+                        short_name,
+                        uptime,
+                        stats.messages_received,
+                        stats.events_processed,
+                        stats.orders_processed,
+                        time_since_last_msg
+                    );
+                    log_status(STATUS_FILE, "HEARTBEAT", &heartbeat_msg);
+                    eprintln!("[{}] {}", get_timestamp(), heartbeat_msg);
+                    stats.last_heartbeat = std::time::Instant::now();
+                }
+                
+                // Process the message
+                let raw_data = match &msg {
             Message::Text(text) => {
                 let timestamp = get_timestamp();
                 let log_line = format!("{}|{}|TEXT|{}\n", timestamp, short_name, text);
@@ -309,7 +354,9 @@ async fn handle_wallet_connection(
                 let _ = tx_messages.send(log_line);
                 bytes.clone()
             }
-            Message::Ping(_) => {
+            Message::Ping(data) => {
+                // Respond to ping with pong
+                let _ = write.send(Message::Pong(data.clone())).await;
                 let _ = tx_messages.send(format!("{}|{}|PING|\n", get_timestamp(), short_name));
                 continue;
             }
@@ -319,7 +366,7 @@ async fn handle_wallet_connection(
             }
             Message::Close(_) => {
                 let _ = tx_messages.send(format!("{}|{}|CLOSE|\n", get_timestamp(), short_name));
-                break;
+                return Err("Connection closed by server".into());
             }
             Message::Frame(_) => {
                 let _ = tx_messages.send(format!("{}|{}|FRAME|\n", get_timestamp(), short_name));
@@ -340,11 +387,23 @@ async fn handle_wallet_connection(
         let channel = match json.get("channel").and_then(|v| v.as_str()) {
             Some(c) => c,
             None => {
+                // Log messages without channel for debugging
                 let timestamp = get_timestamp();
+                let json_str = serde_json::to_string(&json).unwrap_or_else(|_| "parse_error".to_string());
+                log_status(STATUS_FILE, "DEBUG", &format!("Message without channel for {}: {}", short_name, json_str));
                 let _ = tx_messages.send(format!("{}|{}|NO_CHANNEL|\n", timestamp, short_name));
                 continue;
             }
         };
+        
+        // Log all channels we receive for debugging
+        log_status(STATUS_FILE, "DEBUG", &format!("Received {} channel message for {}", channel, short_name));
+        
+        // Handle subscription response (acknowledgment)
+        if channel == "subscriptionResponse" {
+            log_status(STATUS_FILE, "DEBUG", &format!("Subscription response received for {}", short_name));
+            continue;
+        }
         
         // Process userEvents channel
         if channel == "userEvents" {
@@ -394,16 +453,53 @@ async fn handle_wallet_connection(
         
         // Process orderUpdates channel
         else if channel == "orderUpdates" {
-            let orders_iter: Box<dyn Iterator<Item = &Value>> = match json.get("data") {
-                Some(d) if d.is_array() => Box::new(d.as_array().unwrap().iter()),
-                Some(d) if d.is_object() => Box::new(std::iter::once(d)),
-                _ => continue,
+            // Log that we received orderUpdates
+            log_status(STATUS_FILE, "DEBUG", &format!("Received orderUpdates for {}", short_name));
+            
+            let data = match json.get("data") {
+                Some(d) => d,
+                None => {
+                    log_status(STATUS_FILE, "WARN", &format!("orderUpdates message has no data field for {}", short_name));
+                    continue;
+                }
             };
             
-            for order_update in orders_iter {
-                let order = match order_update.get("order") {
+            // Handle array of orders (standard format)
+            if let Some(orders_array) = data.as_array() {
+                log_status(STATUS_FILE, "DEBUG", &format!("Processing {} order updates for {}", orders_array.len(), short_name));
+                
+                for order_update in orders_array {
+                    let order = match order_update.get("order") {
+                        Some(o) => o,
+                        None => {
+                            log_status(STATUS_FILE, "WARN", &format!("orderUpdate missing 'order' field for {}", short_name));
+                            continue;
+                        }
+                    };
+                    
+                    let coin = order.get("coin").and_then(|v| v.as_str()).unwrap_or("-");
+                    let side = order.get("side").and_then(|v| v.as_str()).unwrap_or("-");
+                    let limit_px = order.get("limitPx").and_then(|v| v.as_str()).unwrap_or("-");
+                    let sz = order.get("sz").and_then(|v| v.as_str()).unwrap_or("-");
+                    let oid = order.get("oid").and_then(|v| v.as_i64()).unwrap_or(0);
+                    let timestamp = order.get("timestamp").and_then(|v| v.as_i64()).unwrap_or(0);
+                    
+                    let status = order_update.get("status").and_then(|v| v.as_str()).unwrap_or("-");
+                    let status_timestamp = order_update.get("statusTimestamp").and_then(|v| v.as_i64()).unwrap_or(0);
+                    
+                    handle_order(&tx_events, coin, side, limit_px, sz, oid, status, timestamp, status_timestamp);
+                    stats.orders_processed += 1;
+                }
+            } else if data.is_object() {
+                // Handle single order object (if API sends it this way)
+                log_status(STATUS_FILE, "DEBUG", &format!("Processing single order update (object) for {}", short_name));
+                
+                let order = match data.get("order") {
                     Some(o) => o,
-                    None => continue,
+                    None => {
+                        log_status(STATUS_FILE, "WARN", &format!("orderUpdate object missing 'order' field for {}", short_name));
+                        continue;
+                    }
                 };
                 
                 let coin = order.get("coin").and_then(|v| v.as_str()).unwrap_or("-");
@@ -413,27 +509,25 @@ async fn handle_wallet_connection(
                 let oid = order.get("oid").and_then(|v| v.as_i64()).unwrap_or(0);
                 let timestamp = order.get("timestamp").and_then(|v| v.as_i64()).unwrap_or(0);
                 
-                let status = order_update.get("status").and_then(|v| v.as_str()).unwrap_or("-");
-                let status_timestamp = order_update.get("statusTimestamp").and_then(|v| v.as_i64()).unwrap_or(0);
+                let status = data.get("status").and_then(|v| v.as_str()).unwrap_or("-");
+                let status_timestamp = data.get("statusTimestamp").and_then(|v| v.as_i64()).unwrap_or(0);
                 
                 handle_order(&tx_events, coin, side, limit_px, sz, oid, status, timestamp, status_timestamp);
                 stats.orders_processed += 1;
+            } else {
+                log_status(STATUS_FILE, "WARN", &format!("orderUpdates data is neither array nor object for {}: {:?}", short_name, data));
+            }
+        }
+            }
+            // Send periodic ping to keep connection alive
+            _ = ping_interval.tick() => {
+                if let Err(e) = write.send(Message::Ping(vec![])).await {
+                    log_status(STATUS_FILE, "ERROR", &format!("Failed to send ping for {}: {}", short_name, e));
+                    return Err(format!("Ping failed: {}", e).into());
+                }
             }
         }
     }
-    
-    // Connection closed
-    log_status(STATUS_FILE, "DISCONNECTED", &format!(
-        "Connection closed for {}. Total: {} messages, {} events, {} orders processed",
-        short_name,
-        stats.messages_received,
-        stats.events_processed,
-        stats.orders_processed
-    ));
-    eprintln!("[{}] Connection closed for {}. Processed {} messages, {} events, {} orders", 
-        get_timestamp(), short_name, stats.messages_received, stats.events_processed, stats.orders_processed);
-    
-    Ok(())
 }
 
 #[tokio::main]
