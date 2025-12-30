@@ -1,4 +1,6 @@
 /target
 Cargo.lock
 events.log
+messages.log
+status.log
 *.md
